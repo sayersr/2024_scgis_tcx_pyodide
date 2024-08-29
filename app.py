@@ -5,7 +5,8 @@ import gpxpy.gpx
 import xml.etree.ElementTree as ET
 import matplotlib.pyplot as plt
 import datetime
-import os
+import io
+import base64
 
 app_ui = ui.page_fluid(
     ui.panel_title("TCX File Viewer"),
@@ -25,18 +26,25 @@ def server(input, output, session):
         files = input.tcx_files()
         data = []
         for file in files:
-            with open(file["datapath"], "r") as f:
-                file_content = f.read()
-            gpx, heart_rates, start_time, duration = convert_tcx_to_gpx(file_content)
-            max_hr = max(heart_rates) if heart_rates else 0
-            data.append({
-                "name": os.path.basename(file["name"]),
-                "gpx": gpx,
-                "heart_rates": heart_rates,
-                "start_time": start_time,
-                "duration": duration,
-                "max_hr": max_hr
-            })
+            try:
+                with open(file["datapath"], "r") as f:
+                    file_content = f.read()
+                gpx, heart_rates, start_time, duration = convert_tcx_to_gpx(file_content)
+                max_hr = max(heart_rates) if heart_rates else 0
+                data.append({
+                    "name": file["name"],
+                    "gpx": gpx,
+                    "heart_rates": heart_rates,
+                    "start_time": start_time,
+                    "duration": duration,
+                    "max_hr": max_hr
+                })
+            except Exception as e:
+                print(f"Error processing file {file['name']}: {str(e)}")
+                data.append({
+                    "name": file["name"],
+                    "error": f"Error processing file: {str(e)}"
+                })
         return data
 
     @render.ui
@@ -48,9 +56,12 @@ def server(input, output, session):
         info_html = "<h3>File Information:</h3>"
         for file_data in data:
             info_html += f"<p><strong>{file_data['name']}</strong><br>"
-            info_html += f"Date: {file_data['start_time'].strftime('%Y-%m-%d %H:%M:%S')}<br>"
-            info_html += f"Duration: {str(file_data['duration']).split('.')[0]}<br>"
-            info_html += f"Maximum Heart Rate: {file_data['max_hr']} bpm</p>"
+            if "error" in file_data:
+                info_html += f"Error: {file_data['error']}</p>"
+            else:
+                info_html += f"Date: {file_data['start_time'].strftime('%Y-%m-%d %H:%M:%S')}<br>"
+                info_html += f"Duration: {str(file_data['duration']).split('.')[0]}<br>"
+                info_html += f"Maximum Heart Rate: {file_data['max_hr']} bpm</p>"
         
         return ui.HTML(info_html)
 
@@ -64,16 +75,17 @@ def server(input, output, session):
         colors = ['red', 'blue', 'green', 'purple', 'orange']  # Add more colors if needed
         
         for idx, file_data in enumerate(data):
-            points = []
-            for track in file_data['gpx'].tracks:
-                for segment in track.segments:
-                    for point in segment.points:
-                        points.append((point.latitude, point.longitude))
-            
-            folium.PolyLine(points, color=colors[idx % len(colors)], weight=2.5, opacity=1).add_to(map)
+            if "error" not in file_data:
+                points = []
+                for track in file_data['gpx'].tracks:
+                    for segment in track.segments:
+                        for point in segment.points:
+                            points.append((point.latitude, point.longitude))
+                
+                folium.PolyLine(points, color=colors[idx % len(colors)], weight=2.5, opacity=1).add_to(map)
         
         # Fit bounds to include all tracks
-        all_points = [point for file_data in data for track in file_data['gpx'].tracks for segment in track.segments for point in segment.points]
+        all_points = [point for file_data in data if "error" not in file_data for track in file_data['gpx'].tracks for segment in track.segments for point in segment.points]
         if all_points:
             map.fit_bounds([(p.latitude, p.longitude) for p in all_points])
         
@@ -82,15 +94,22 @@ def server(input, output, session):
     @render.plot
     def heart_rate_plot():
         data = load_tcx_files()
-        if data is None:
+        if data is None or all("error" in file_data for file_data in data):
             return None
         
         fig, ax = plt.subplots(figsize=(12, 6))
         colors = ['red', 'blue', 'green', 'purple', 'orange']  # Add more colors if needed
         
+        max_duration = datetime.timedelta()
+        for file_data in data:
+            if "error" not in file_data:
+                max_duration = max(max_duration, file_data['duration'])
+        
+        time_labels = [str(datetime.timedelta(seconds=s)) for s in range(int(max_duration.total_seconds()) + 1)]
+        
         for idx, file_data in enumerate(data):
-            time_labels = [str(datetime.timedelta(seconds=s)) for s in range(len(file_data['heart_rates']))]
-            ax.plot(time_labels, file_data['heart_rates'], color=colors[idx % len(colors)], label=file_data['name'])
+            if "error" not in file_data:
+                ax.plot(time_labels[:len(file_data['heart_rates'])], file_data['heart_rates'], color=colors[idx % len(colors)], label=file_data['name'])
         
         ax.set_xlabel("Time (hours:minutes:seconds)")
         ax.set_ylabel("Heart Rate (bpm)")
@@ -108,7 +127,14 @@ def server(input, output, session):
         return fig
 
 def convert_tcx_to_gpx(tcx_content):
-    tcx_root = ET.fromstring(tcx_content)
+    def parse_xml(content):
+        return ET.fromstring(content)
+
+    try:
+        tcx_root = parse_xml(tcx_content)
+    except ET.ParseError as e:
+        raise ValueError(f"Unable to parse TCX file. Error: {str(e)}. File starts with: {tcx_content[:100]}")
+
     gpx = gpxpy.gpx.GPX()
     track = gpxpy.gpx.GPXTrack()
     gpx.tracks.append(track)
@@ -142,6 +168,9 @@ def convert_tcx_to_gpx(tcx_content):
         
         if hr is not None:
             heart_rates.append(int(hr.text))
+
+    if not segment.points:
+        raise ValueError("No valid GPS points found in the TCX file")
 
     duration = end_time - start_time if start_time and end_time else datetime.timedelta()
     return gpx, heart_rates, start_time, duration
