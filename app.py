@@ -5,7 +5,6 @@ import gpxpy.gpx
 import xml.etree.ElementTree as ET
 import matplotlib.pyplot as plt
 import datetime
-import statistics
 import os
 
 app_ui = ui.page_fluid(
@@ -29,14 +28,14 @@ def server(input, output, session):
             with open(file["datapath"], "r") as f:
                 file_content = f.read()
             gpx, heart_rates, start_time, duration = convert_tcx_to_gpx(file_content)
-            avg_hr = statistics.mean(heart_rates) if heart_rates else 0
+            max_hr = max(heart_rates) if heart_rates else 0
             data.append({
                 "name": os.path.basename(file["name"]),
                 "gpx": gpx,
                 "heart_rates": heart_rates,
                 "start_time": start_time,
                 "duration": duration,
-                "avg_hr": avg_hr
+                "max_hr": max_hr
             })
         return data
 
@@ -51,7 +50,7 @@ def server(input, output, session):
             info_html += f"<p><strong>{file_data['name']}</strong><br>"
             info_html += f"Date: {file_data['start_time'].strftime('%Y-%m-%d %H:%M:%S')}<br>"
             info_html += f"Duration: {str(file_data['duration']).split('.')[0]}<br>"
-            info_html += f"Average Heart Rate: {file_data['avg_hr']:.1f} bpm</p>"
+            info_html += f"Maximum Heart Rate: {file_data['max_hr']} bpm</p>"
         
         return ui.HTML(info_html)
 
