@@ -1,7 +1,5 @@
 shiny
-gpxpy
-matplotlib
+plotly
 folium
-branca
-requests
-xyzservices
+pandas
+numpy
