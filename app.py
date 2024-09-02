@@ -5,32 +5,66 @@ import plotly.io as pio
 import plotly.utils
 import datetime
 import io
-import folium
-from folium.plugins import MousePosition
 import pandas as pd
 import numpy as np
 import json
+
+def convert_tcx(tcx_content):
+    root = ET.fromstring(tcx_content)
+    ns = {'ns': 'http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2'}
+    
+    points = []
+    heart_rates = []
+    timestamps = []
+    
+    for trackpoint in root.findall('.//ns:Trackpoint', ns):
+        position = trackpoint.find('ns:Position', ns)
+        if position is not None:
+            lat = float(position.find('ns:LatitudeDegrees', ns).text)
+            lon = float(position.find('ns:LongitudeDegrees', ns).text)
+            points.append((lat, lon))
+            
+            heart_rate = trackpoint.find('.//ns:HeartRateBpm/ns:Value', ns)
+            heart_rates.append(int(heart_rate.text) if heart_rate is not None else None)
+            
+            time = trackpoint.find('ns:Time', ns)
+            if time is not None:
+                timestamps.append(datetime.datetime.fromisoformat(time.text.replace('Z', '+00:00')))
+    
+    start_time = timestamps[0] if timestamps else None
+    duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else datetime.timedelta(0)
+    
+    return points, heart_rates, start_time, duration, timestamps
 
 # Define a list of contrasting colors
 CONTRASTING_COLORS = ['#FF0000', '#00FF00', '#0000FF', '#FF00FF', '#00FFFF', '#FFFF00', '#800000', '#008000', '#000080', '#800080']
 
 app_ui = ui.page_fluid(
     ui.panel_title("TCX Data Viewer"),
+    ui.tags.head(
+        ui.tags.link(rel="stylesheet", href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"),
+        ui.tags.script(src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"),
+    ),
     ui.layout_sidebar(
         ui.sidebar(
             ui.input_file("data_files", "Upload TCX file(s)", accept=[".tcx"], multiple=True),
             ui.output_ui("file_info"),
         ),
-        ui.column(12, ui.output_ui("map_output")),
-        ui.column(12, ui.output_ui("heart_rate_plot")),
-        ui.output_text("debug_info"),
+        ui.column(12, 
+            ui.div(
+                ui.output_ui("map_output"),
+                ui.output_ui("heart_rate_plot"),
+                style="display: flex; flex-direction: column; gap: 10px;"
+            )
+        ),
+        ui.output_text("debug_map_info"),
     )
 )
 
 def server(input, output, session):
     data = reactive.Value({})
     timeline_data = reactive.Value(pd.DataFrame())
-    plot_data = reactive.Value(None)
+    plot_data_reactive = reactive.Value(None)
 
     @reactive.Effect
     @reactive.event(input.data_files)
@@ -83,8 +117,8 @@ def server(input, output, session):
             combined_data = pd.concat(all_data, ignore_index=True)
             # Ensure timestamp column is in datetime format
             combined_data["timestamp"] = pd.to_datetime(combined_data["timestamp"], utc=True)
-            # Calculate elapsed time in seconds
-            combined_data["elapsed_time"] = (combined_data["timestamp"] - combined_data["timestamp"].min()).dt.total_seconds()
+            # Calculate elapsed time in seconds for each file separately
+            combined_data["elapsed_time"] = combined_data.groupby("file")["timestamp"].transform(lambda x: (x - x.min()).dt.total_seconds())
             timeline_data.set(combined_data)
 
     @output
@@ -123,55 +157,79 @@ def server(input, output, session):
         if not all_points:
             return "No valid GPS points found"
 
-        # Calculate the bounding box
+        # Calculate the center and zoom level
         lats, lons = zip(*all_points)
-        min_lat, max_lat = min(lats), max(lats)
-        min_lon, max_lon = min(lons), max(lons)
+        center_lat = (min(lats) + max(lats)) / 2
+        center_lon = (min(lons) + max(lons)) / 2
 
-        # Create a map centered on the middle of the bounding box
-        m = folium.Map(
-            location=[(min_lat + max_lat) / 2, (min_lon + max_lon) / 2],
-            zoom_start=12
-        )
+        map_data = {
+            "center": [center_lat, center_lon],
+            "zoom": 12,
+            "tracks": [
+                {
+                    "name": filename,
+                    "color": file_data['color'],
+                    "points": file_data['points']
+                }
+                for filename, file_data in data_info.items()
+                if "error" not in file_data
+            ]
+        }
 
-        for filename, file_data in data_info.items():
-            if "error" not in file_data:
-                points = file_data['points']
-                if points:
-                    # Add the track as a polyline
-                    folium.PolyLine(points, color=file_data['color'], weight=2.5, opacity=0.8, popup=filename).add_to(m)
-
-                    # Add markers for start and end points
-                    folium.Marker(points[0], popup=f"Start - {filename}", icon=folium.Icon(color='green', icon='play')).add_to(m)
-                    folium.Marker(points[-1], popup=f"End - {filename}", icon=folium.Icon(color='red', icon='stop')).add_to(m)
-
-        # Add a marker for the current position (will be updated by JavaScript)
-        folium.Marker([0, 0], popup="Current Position", icon=folium.Icon(color='purple', icon='info-sign')).add_to(m)
-
-        # Fit the map to the bounding box
-        m.fit_bounds([(min_lat, min_lon), (max_lat, max_lon)])
-
-        # Add mouse position display
-        MousePosition().add_to(m)
-
-        # Convert the map to HTML
-        map_html = m._repr_html_()
-
-        # Wrap the map HTML in a div with a fixed height and width
         return ui.HTML(f"""
-        <div id='map' style='height: 800px; width: 100%;'>
-            {map_html}
-        </div>
+        <div id="map" style="height: 400px; width: 100%;"></div>
         <script>
-            // Function to update marker position
-            function updateMarkerPosition(lat, lon) {{
-                var map = document.getElementById('map')._leaflet_map;
-                map.eachLayer(function(layer) {{
-                    if(layer instanceof L.Marker && layer.getPopup().getContent() === "Current Position") {{
-                        layer.setLatLng([lat, lon]);
-                    }}
-                }});
+        var mapData = {json.dumps(map_data)};
+        var map, currentPositionMarkers = {{}};
+        
+        function initializeMap() {{
+            if (map) {{
+                map.remove();
             }}
+            map = L.map('map').setView(mapData.center, mapData.zoom);
+            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            }}).addTo(map);
+
+            mapData.tracks.forEach(function(track) {{
+                L.polyline(track.points, {{color: track.color}}).addTo(map);
+                L.marker(track.points[0], {{
+                    icon: L.divIcon({{
+                        className: 'custom-div-icon',
+                        html: `<div style='background-color:${{track.color}};' class='marker-pin'></div><i class='fa fa-circle' style='color: white;'></i>`,
+                        iconSize: [30, 42],
+                        iconAnchor: [15, 42]
+                    }})
+                }}).addTo(map).bindPopup('Start - ' + track.name);
+                L.marker(track.points[track.points.length - 1], {{
+                    icon: L.divIcon({{
+                        className: 'custom-div-icon',
+                        html: `<div style='background-color:${{track.color}};' class='marker-pin'></div><i class='fa fa-flag' style='color: white;'></i>`,
+                        iconSize: [30, 42],
+                        iconAnchor: [15, 42]
+                    }})
+                }}).addTo(map).bindPopup('End - ' + track.name);
+            }});
+        }}
+
+        // Initialize map after a short delay to ensure the container is ready
+        setTimeout(initializeMap, 100);
+
+        function updateMarkerPosition(lat, lon, color, filename) {{
+            if (!map) return;
+            
+            if (!currentPositionMarkers[filename]) {{
+                currentPositionMarkers[filename] = L.circleMarker([lat, lon], {{
+                    color: color,
+                    fillColor: color,
+                    fillOpacity: 0.8,
+                    radius: 8
+                }}).addTo(map);
+            }} else {{
+                currentPositionMarkers[filename].setLatLng([lat, lon]);
+            }}
+            map.panTo([lat, lon]);
+        }}
         </script>
         """)
 
@@ -180,7 +238,7 @@ def server(input, output, session):
     def heart_rate_plot():
         return ui.HTML("""
         <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-        <div id="plotly-heart-rate" style="width:100%;height:400px;"></div>
+        <div id="plotly-heart-rate" style="width:100%;height:300px;"></div>
         """)
 
     @reactive.Effect
@@ -188,7 +246,7 @@ def server(input, output, session):
     def _():
         data_info = timeline_data.get()
         if data_info.empty:
-            plot_data.set(None)
+            plot_data_reactive.set(None)
             return
 
         fig = go.Figure()
@@ -201,7 +259,7 @@ def server(input, output, session):
             
             if not valid_data.empty:
                 fig.add_trace(go.Scatter(
-                    x=valid_data['elapsed_time'],
+                    x=valid_data['elapsed_time'] / 60,  # Convert to minutes
                     y=valid_data['heart_rate'],
                     mode='lines',
                     name=file_name,
@@ -210,44 +268,55 @@ def server(input, output, session):
 
         fig.update_layout(
             title="Heart Rate Over Time",
-            xaxis_title="Time (minutes:seconds)",
+            xaxis_title="Time Elapsed (minutes)",
             yaxis_title="Heart Rate (bpm)",
             hovermode="x unified",
-            height=400,
+            height=300,
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
 
-        # Update x-axis to show minutes:seconds
-        max_time = data_info['elapsed_time'].max()
-        tick_values = list(range(0, int(max_time) + 1, max(1, int(max_time // 10))))
-        tick_texts = [f"{int(t // 60):02d}:{int(t % 60):02d}" for t in tick_values]
-
-        fig.update_xaxes(
-            tickmode='array',
-            tickvals=tick_values,
-            ticktext=tick_texts
-        )
-
-        plot_json = json.dumps(fig.to_dict(), cls=plotly.utils.PlotlyJSONEncoder)
-        plot_data.set(plot_json)
+        plot_data_json = json.dumps(fig.data, cls=plotly.utils.PlotlyJSONEncoder)
+        layout_data_json = json.dumps(fig.layout, cls=plotly.utils.PlotlyJSONEncoder)
+        
+        plot_data_reactive.set((plot_data_json, layout_data_json))
 
     @reactive.Effect
-    @reactive.event(plot_data)
-    def _():
-        plot_json = plot_data.get()
-        if plot_json is not None:
+    @reactive.event(plot_data_reactive)
+    def update_plot():
+        plot_data = plot_data_reactive.get()
+        if plot_data is not None:
+            plot_data_json, layout_data_json = plot_data
             ui.insert_ui(
                 ui.tags.script(f"""
-                    Plotly.newPlot('plotly-heart-rate', {plot_json});
-                    var plotlyDiv = document.getElementById('plotly-heart-rate');
-                    plotlyDiv.on('plotly_hover', function(data){{
-                        var x = data.points[0].x;
-                        Shiny.setInputValue('hover_time', x);
-                    }});
+                Plotly.newPlot('plotly-heart-rate', {plot_data_json}, {layout_data_json});
+                var plotlyDiv = document.getElementById('plotly-heart-rate');
+                plotlyDiv.on('plotly_hover', function(data){{
+                    var x = data.points[0].x;
+                    Shiny.setInputValue('hover_time', x);
+                }});
                 """),
                 selector="#plotly-heart-rate",
                 where="afterEnd"
             )
+
+    @reactive.Effect
+    @reactive.event(input.hover_time)
+    def _():
+        hover_time = input.hover_time()
+        data_info = timeline_data.get()
+        if not data_info.empty and hover_time is not None:
+            # Convert hover_time back to seconds
+            hover_time_seconds = hover_time * 60
+            current_data = data_info[data_info['elapsed_time'] <= hover_time_seconds].groupby('file').last()
+            
+            if not current_data.empty:
+                # Update the map marker position using JavaScript for each file
+                for _, row in current_data.iterrows():
+                    ui.insert_ui(
+                        ui.tags.script(f"updateMarkerPosition({row['lat']}, {row['lon']}, '{row['color']}', '{row.name}');"),
+                        selector="#map",
+                        where="afterEnd"
+                    )
 
     @output
     @render.text
@@ -261,84 +330,5 @@ def server(input, output, session):
         debug_str += f"Heart rate range: {data_info['heart_rate'].min()} - {data_info['heart_rate'].max()}\n"
         debug_str += f"Time range: {data_info['elapsed_time'].min()} - {data_info['elapsed_time'].max()} seconds"
         return debug_str
-
-    @reactive.Effect
-    @reactive.event(input.hover_time)
-    def _():
-        hover_time = input.hover_time()
-        data_info = timeline_data.get()
-        if not data_info.empty and hover_time is not None:
-            current_data = data_info[data_info['elapsed_time'] <= hover_time].iloc[-1]
-            
-            # Update the map marker position using JavaScript
-            ui.insert_ui(
-                ui.tags.script(f"""
-                    updateMarkerPosition({current_data['lat']}, {current_data['lon']});
-                """),
-                selector="#map",
-                where="afterEnd"
-            )
-
-def convert_tcx(tcx_content):
-    def parse_xml(content):
-        return ET.fromstring(content)
-
-    try:
-        tcx_root = parse_xml(tcx_content)
-    except ET.ParseError as e:
-        raise ValueError(f"Unable to parse TCX data. Error: {str(e)}. Data starts with: {tcx_content[:100]}")
-
-    namespace = {'ns': 'http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2'}
-
-    data = []
-    start_time = None
-    end_time = None
-
-    for trackpoint in tcx_root.findall('.//ns:Trackpoint', namespace):
-        point = {}
-
-        time = trackpoint.find('ns:Time', namespace)
-        if time is not None:
-            current_time = datetime.datetime.fromisoformat(time.text)
-            if start_time is None:
-                start_time = current_time
-            end_time = current_time
-            point['timestamp'] = current_time
-
-        lat = trackpoint.find('ns:Position/ns:LatitudeDegrees', namespace)
-        lon = trackpoint.find('ns:Position/ns:LongitudeDegrees', namespace)
-        if lat is not None and lon is not None:
-            point['lat'] = float(lat.text)
-            point['lon'] = float(lon.text)
-
-        hr = trackpoint.find('.//ns:HeartRateBpm/ns:Value', namespace)
-        if hr is not None:
-            point['heart_rate'] = int(hr.text)
-
-        if point:  # Only append if we have any data for this trackpoint
-            data.append(point)
-
-    if not data:
-        raise ValueError("No valid data found in the TCX file")
-
-    # Convert to DataFrame for easier processing
-    df = pd.DataFrame(data)
-
-    # Ensure all necessary columns exist
-    for col in ['timestamp', 'lat', 'lon', 'heart_rate']:
-        if col not in df.columns:
-            df[col] = None
-
-    # Sort by timestamp
-    df = df.sort_values('timestamp')
-
-    # Extract data
-    timestamps = df['timestamp'].tolist()
-    heart_rates = df['heart_rate'].tolist()
-    points = list(zip(df['lat'].fillna(method='ffill'), df['lon'].fillna(method='ffill')))
-
-    duration = end_time - start_time if start_time and end_time else datetime.timedelta()
-    
-    return points, heart_rates, start_time, duration, timestamps
-
+        
 app = App(app_ui, server)
