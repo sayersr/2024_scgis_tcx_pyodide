@@ -36,11 +36,11 @@ def convert_tcx(tcx_content):
     
     return points, heart_rates, start_time, duration, timestamps
 
-# Define a list of contrasting colors
-CONTRASTING_COLORS = ['#FF0000', '#00FF00', '#0000FF', '#FF00FF', '#00FFFF', '#FFFF00', '#800000', '#008000', '#000080', '#800080']
+# Define colorblind-friendly colors
+COLORBLIND_FRIENDLY_COLORS = ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7', '#999999']
 
 app_ui = ui.page_fluid(
-    ui.panel_title("TCX Data Viewer"),
+    ui.panel_title("Pyodide TCX Demo"),
     ui.tags.head(
         ui.tags.link(rel="stylesheet", href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"),
         ui.tags.script(src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"),
@@ -57,7 +57,7 @@ app_ui = ui.page_fluid(
                 style="display: flex; flex-direction: column; gap: 10px;"
             )
         ),
-        ui.output_text("debug_map_info"),
+        ui.output_text("debug_info"),
     )
 )
 
@@ -85,7 +85,7 @@ def server(input, output, session):
                 
                 valid_heart_rates = [hr for hr in heart_rates if hr is not None]
                 max_hr = max(valid_heart_rates) if valid_heart_rates else None
-                color = CONTRASTING_COLORS[i % len(CONTRASTING_COLORS)]
+                color = COLORBLIND_FRIENDLY_COLORS[i % len(COLORBLIND_FRIENDLY_COLORS)]
                 processed_data[file["name"]] = {
                     "points": points,
                     "heart_rates": heart_rates,
@@ -187,27 +187,23 @@ def server(input, output, session):
                 map.remove();
             }}
             map = L.map('map').setView(mapData.center, mapData.zoom);
-            L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            L.tileLayer('https://cartodb-basemaps-{{s}}.global.ssl.fastly.net/light_all/{{z}}/{{x}}/{{y}}.png', {{
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, &copy; <a href="https://carto.com/attribution">CARTO</a>'
             }}).addTo(map);
 
             mapData.tracks.forEach(function(track) {{
-                L.polyline(track.points, {{color: track.color}}).addTo(map);
-                L.marker(track.points[0], {{
-                    icon: L.divIcon({{
-                        className: 'custom-div-icon',
-                        html: `<div style='background-color:${{track.color}};' class='marker-pin'></div><i class='fa fa-circle' style='color: white;'></i>`,
-                        iconSize: [30, 42],
-                        iconAnchor: [15, 42]
-                    }})
+                L.polyline(track.points, {{color: track.color, weight: 3, opacity: 0.8}}).addTo(map);
+                L.circleMarker(track.points[0], {{
+                    color: 'black',
+                    fillColor: track.color,
+                    fillOpacity: 1,
+                    radius: 6
                 }}).addTo(map).bindPopup('Start - ' + track.name);
-                L.marker(track.points[track.points.length - 1], {{
-                    icon: L.divIcon({{
-                        className: 'custom-div-icon',
-                        html: `<div style='background-color:${{track.color}};' class='marker-pin'></div><i class='fa fa-flag' style='color: white;'></i>`,
-                        iconSize: [30, 42],
-                        iconAnchor: [15, 42]
-                    }})
+                L.circleMarker(track.points[track.points.length - 1], {{
+                    color: 'black',
+                    fillColor: track.color,
+                    fillOpacity: 1,
+                    radius: 6
                 }}).addTo(map).bindPopup('End - ' + track.name);
             }});
         }}
@@ -328,7 +324,7 @@ def server(input, output, session):
         debug_str = f"Total rows: {len(data_info)}\n"
         debug_str += f"Columns: {', '.join(data_info.columns)}\n"
         debug_str += f"Heart rate range: {data_info['heart_rate'].min()} - {data_info['heart_rate'].max()}\n"
-        debug_str += f"Time range: {data_info['elapsed_time'].min()} - {data_info['elapsed_time'].max()} seconds"
+        debug_str += f"Time range: {data_info['elapsed_time'].min() / 60:.2f} - {data_info['elapsed_time'].max() / 60:.2f} minutes"
         return debug_str
         
 app = App(app_ui, server)
